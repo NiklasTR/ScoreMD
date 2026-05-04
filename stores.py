@@ -73,6 +73,17 @@ def create_dataset_store(store):
         name="minipeptides",
     )
 
+    dataset_store(
+        builds(
+            SingleProteinDataset,
+            npz_path="/mnt/labs/data/tong/many-peptides-md/trajectories_subsampled/test/10AA/GYDPETGTWG_subsampled.npz",
+            name="chignolin",
+            validation=False,
+            populate_full_signature=True,
+        ),
+        name="chignolin",
+    )
+
     def generate_protein_dataset(name, file_names, tica_file_name, topology_file_name):
         dataset_store(
             builds(
@@ -86,7 +97,6 @@ def create_dataset_store(store):
             name=name,
         )
 
-    generate_protein_dataset("chignolin", ["chignolin-0_ca.h5"], "chignolin_tica.pic", "chignolin.pdb")
     generate_protein_dataset("trpcage", ["trpcage-0_ca.h5"], "trpcage_tica.pic", "trpcage.pdb")
     generate_protein_dataset("bba", ["bba-0_ca.h5", "bba-1_ca.h5"], "bba_tica.pic", "bba.pdb")
 

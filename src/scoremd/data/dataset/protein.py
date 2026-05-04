@@ -5,6 +5,7 @@ from typing import Callable, Optional, Sequence, Tuple
 import jax
 from scoremd.data.dataset.base import Datapoints, Dataset
 import jax.numpy as jnp
+import numpy as onp
 import openmm.unit as unit
 import logging
 import mdtraj as md
@@ -22,6 +23,9 @@ from openmm.app import PDBFile
 
 log = logging.getLogger(__name__)
 
+DEFAULT_CHIGNOLIN_NPZ = "/mnt/labs/data/tong/many-peptides-md/trajectories_subsampled/test/10AA/GYDPETGTWG_subsampled.npz"
+DEFAULT_CHIGNOLIN_SEQUENCE = "GYDPETGTWG"
+
 
 @dataclass
 class SingleProteinDataset(Dataset):
@@ -32,22 +36,30 @@ class SingleProteinDataset(Dataset):
 
     def __init__(
         self,
-        paths: PathLike | Sequence[PathLike],
-        tica_path: PathLike,
-        topology_path: PathLike,
+        paths: Optional[PathLike | Sequence[PathLike]] = None,
+        tica_path: Optional[PathLike] = None,
+        topology_path: Optional[PathLike] = None,
+        npz_path: Optional[PathLike] = None,
+        sequence: Optional[str] = None,
         train_split: float = 0.8,
         limit_samples: Optional[int] = None,
         validation: bool = True,
         seed: int = 0,
         name="protein",
     ):
-        dataset_name = os.path.basename(tica_path).split("_")[0]
+        dataset_name = name if tica_path is None else os.path.basename(tica_path).split("_")[0]
         log.info(f"Loading dataset: {dataset_name}")
 
         self.train_split = train_split
         self.limit_samples = limit_samples
         self.validation = validation
         self.seed = seed
+        self.sequence = sequence
+        self._positions = None
+        self._tica_mean = None
+        self._tica_projection = None
+        self._tica_dim = None
+        self._tica_featurization = None
 
         self.range = None
         if dataset_name == "chignolin":
@@ -62,19 +74,77 @@ class SingleProteinDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset name: {dataset_name}")
 
-        self._dataset = md.load(paths)
-        tica_model = pickle.load(open(tica_path, "rb"))
-        self._tica_transform = SingleProteinDataset.build_tica_transform_jax(tica_model)
+        if dataset_name == "chignolin":
+            if npz_path is None and paths is not None:
+                path_candidates = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
+                if len(path_candidates) == 1 and str(path_candidates[0]).endswith(".npz"):
+                    npz_path = path_candidates[0]
+            self._load_chignolin_npz(npz_path or DEFAULT_CHIGNOLIN_NPZ, sequence)
+            self._dataset = None
+            self.topology = self._build_chignolin_topology(self.sequence)
+            self.mass = jnp.array([atom.element.mass for atom in self.topology.atoms()]).reshape(-1, 1)
+        else:
+            if paths is None or tica_path is None or topology_path is None:
+                raise ValueError(f"{dataset_name} requires paths, tica_path, and topology_path")
+            self._dataset = md.load(paths)
+            tica_model = pickle.load(open(tica_path, "rb"))
+            self._tica_transform = SingleProteinDataset.build_tica_transform_jax(tica_model)
 
-        self.mass = jnp.array([atom.element.mass for atom in self._dataset.topology.atoms]).reshape(-1, 1)
-
-        self.topology = PDBFile(topology_path).topology
+            self.mass = jnp.array([atom.element.mass for atom in self._dataset.topology.atoms]).reshape(-1, 1)
+            self.topology = PDBFile(topology_path).topology
 
         super().__init__(
             name=name,
             sample_shape=(self.mass.shape[0], 3),
             kbT=(unit.MOLAR_GAS_CONSTANT_R * T * unit.kelvin).value_in_unit(unit.kilojoules_per_mole),
         )
+
+    def _load_chignolin_npz(self, npz_path: PathLike, sequence: Optional[str]) -> None:
+        with onp.load(os.path.expanduser(npz_path), allow_pickle=False) as data:
+            if "positions" not in data.files:
+                raise KeyError(f"Chignolin NPZ {npz_path} has no 'positions' key")
+            for key in ("tica_mean", "tica_projection", "tica_dim"):
+                if key not in data.files:
+                    raise KeyError(f"Chignolin NPZ {npz_path} has no {key!r} key")
+
+            self._positions = jnp.asarray(onp.asarray(data["positions"], dtype=onp.float32))
+            if self._positions.ndim != 3 or self._positions.shape[-1] != 3:
+                raise ValueError(
+                    f"Chignolin positions must have shape (frames, atoms, 3), got {self._positions.shape}"
+                )
+            self._tica_mean = jnp.asarray(onp.asarray(data["tica_mean"], dtype=onp.float64))
+            self._tica_projection = jnp.asarray(onp.asarray(data["tica_projection"], dtype=onp.float64))
+            self._tica_dim = int(onp.asarray(data["tica_dim"]).item())
+            self._tica_featurization = str(onp.asarray(data["tica_featurization"]).item()) if "tica_featurization" in data.files else "cns_dihedrals"
+
+            stored_sequence = str(onp.asarray(data["sequence"]).item()) if "sequence" in data.files else DEFAULT_CHIGNOLIN_SEQUENCE
+            self.sequence = sequence or stored_sequence
+
+        if self.sequence != DEFAULT_CHIGNOLIN_SEQUENCE:
+            raise ValueError(f"Chignolin dataset expected sequence {DEFAULT_CHIGNOLIN_SEQUENCE}, got {self.sequence}")
+
+    @staticmethod
+    def _build_chignolin_topology(sequence: str):
+        try:
+            from thermax.core.peptide.pdb import sequence_to_pdb_block
+        except ImportError:
+            sequence_to_pdb_block = None
+
+        if sequence_to_pdb_block is not None:
+            from io import StringIO
+
+            topology = PDBFile(StringIO(sequence_to_pdb_block(sequence))).topology
+            if topology.getNumAtoms() == 138:
+                return topology
+
+        from openmm.app import Element, Topology
+
+        topology = Topology()
+        chain = topology.addChain("A")
+        residue = topology.addResidue(sequence, chain)
+        for i in range(138):
+            topology.addAtom(f"X{i + 1}", Element.getByAtomicNumber(6), residue)
+        return topology
 
     def _split_data(self, data: jnp.ndarray, key) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], Optional[jnp.ndarray]]:
         if key is not None:
@@ -102,7 +172,7 @@ class SingleProteinDataset(Dataset):
         return train, val if val.shape[0] > 0 else None
 
     def _get_data(self) -> Tuple[Datapoints, Optional[Datapoints], Optional[Datapoints]]:
-        data = jnp.array(self._dataset.xyz)
+        data = self._positions if self._positions is not None else jnp.array(self._dataset.xyz)
         data = data.reshape(data.shape[0], -1)
         train, val = self._split_data(data, jax.random.PRNGKey(self.seed))
 
@@ -118,7 +188,7 @@ class SingleProteinDataset(Dataset):
 
     @property
     def atom_names(self):
-        return [atom.name for atom in self._dataset.topology.atoms]
+        return [atom.name for atom in self.topology.atoms()]
 
     @staticmethod
     def _distances(xyz):
@@ -169,11 +239,57 @@ class SingleProteinDataset(Dataset):
 
         return transform
 
+    def _project_stored_tica(self, features):
+        if self._tica_mean is None or self._tica_projection is None or self._tica_dim is None:
+            raise RuntimeError("Stored tICA parameters are not loaded")
+        centered = jnp.asarray(features) - self._tica_mean.reshape(1, -1)
+        return centered @ self._tica_projection[:, : self._tica_dim]
+
     def get_2d_features(self, samples):
         samples = jnp.array(samples.reshape(-1, *self.sample_shape))
-        tica_features = SingleProteinDataset._tica_features(samples)
-        samples = self._tica_transform(tica_features)
-        return samples[:, 0], samples[:, 1]
+        if self._tica_mean is not None:
+            tica_features = self._chignolin_tica_features(samples)
+            tics = self._project_stored_tica(tica_features)
+        else:
+            tica_features = SingleProteinDataset._tica_features(samples)
+            tics = self._tica_transform(tica_features)
+        return tics[:, 0], tics[:, 1]
+
+    def _chignolin_tica_features(self, samples):
+        if self._tica_featurization != "cns_dihedrals":
+            return SingleProteinDataset._tica_features(samples)
+        return self._cns_dihedral_features(samples)
+
+    def _cns_dihedral_features(self, samples):
+        xyz = onp.asarray(samples, dtype=onp.float32)
+        traj = md.Trajectory(xyz, topology=md.Topology.from_openmm(self.topology))
+        cns_selection = "symbol == C or symbol == N or symbol == S"
+        traj_cns = traj.atom_slice(traj.top.select(cns_selection))
+        distances = onp.asarray(SingleProteinDataset._pairwise_distances_np(traj_cns.xyz), dtype=onp.float64)
+
+        _, phi = md.compute_phi(traj)
+        _, psi = md.compute_psi(traj)
+        _, omega = md.compute_omega(traj)
+
+        parts = [distances]
+        if phi.size > 0:
+            parts.extend([onp.sin(phi), onp.cos(phi)])
+        if psi.size > 0:
+            parts.extend([onp.sin(psi), onp.cos(psi)])
+        if omega.size > 0:
+            parts.extend([onp.sin(omega), onp.cos(omega)])
+        features = onp.concatenate(parts, axis=-1)
+        if features.shape[1] != self._tica_mean.shape[0]:
+            raise ValueError(
+                f"Computed {features.shape[1]} tICA features, expected {self._tica_mean.shape[0]}"
+            )
+        return jnp.asarray(features)
+
+    @staticmethod
+    def _pairwise_distances_np(xyz):
+        n_atoms = xyz.shape[1]
+        i, j = onp.triu_indices(n_atoms, k=1)
+        return onp.linalg.norm(xyz[:, i, :] - xyz[:, j, :], axis=-1)
 
     def plot_2d(
         self, samples, weights=None, range=None, title=None, bins=100, cmap="turbo_r", vmin=None, vmax=None, **kwargs

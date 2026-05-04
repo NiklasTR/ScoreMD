@@ -1,7 +1,7 @@
 [project]
 description = "A framework for training energy-based diffusion models with stable, self-consistent scores near the data distribution."
 name = "ScoreMD"
-requires-python = "== 3.11.*"
+requires-python = ">=3.10"
 version = "1.0.0"
 
 [build-system]
