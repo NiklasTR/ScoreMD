@@ -3,6 +3,20 @@ description = "A framework for training energy-based diffusion models with stabl
 name = "ScoreMD"
 requires-python = ">=3.10"
 version = "1.0.0"
+dependencies = [
+    "deeptime>=0.4.4,<0.5",
+    "flax>=0.10.4",
+    "jax>=0.5.2",
+    "matplotlib>=3.9.4",
+    "mdtraj>=1.9.9",
+    "numpy>=1.26.4",
+    "openmm>=8.2.0",
+    "optax>=0.2.7",
+    "pandas>=2.2.2",
+    "scipy>=1.14.0",
+    "tqdm>=4.67.0",
+    "wandb>=0.19.5",
+]
 
 [build-system]
 build-backend = "hatchling.build"
